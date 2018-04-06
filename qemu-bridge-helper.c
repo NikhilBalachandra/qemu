@@ -15,23 +15,49 @@
 
 #include "qemu/osdep.h"
 
-
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/prctl.h>
-
 #include <net/if.h>
 
+#if defined(__linux__)
+#include <sys/prctl.h>
 #include <linux/sockios.h>
+#include "net/tap-linux.h"
+#define PATH_NET_TAP "/dev/net/tun"
+#elif defined(__FreeBSD__) || defined(__APPLE__)
+#include <sys/sockio.h>
+#define PATH_NET_TAP "/dev/tap"
+#endif
 
-#ifndef SIOCBRADDIF
+#if defined(__linux__) && !defined(SIOCBRADDIF)
 #include <linux/if_bridge.h>
 #endif
 
-#include "qemu/queue.h"
+#if defined(__FreeBSD__)
+#include <net/ethernet.h>
+#include <net/if_bridgevar.h>
+#endif
 
-#include "net/tap-linux.h"
+/* Unlike other BSDs, macOS does not ship with if_bridgevar.h header and has
+ * marked header file as private (internal to Apple). Since this header file
+ * is similar to what found in other BSDs, it should have a fairly stable API
+ * to be used in this file.
+ */
+#if defined(__APPLE__)
+#ifndef PRIVATE
+#define PRIVATE 1
+#include "osx/if_bridgevar.h"
+#undef PRIVATE
+#else
+#include "osx/if_bridgevar.h"
+#endif
+#endif
+
+#include "qemu/queue.h"
+#include "qapi/error.h"
+
+#include "net/tap_int.h"
 
 #ifdef CONFIG_LIBCAP
 #include <cap-ng.h>
@@ -143,6 +169,13 @@ static int parse_acl_file(const char *filename, ACLList *acl_list)
     return 0;
 }
 
+static void prep_ifreq(struct ifreq *ifr, const char *ifname)
+{
+    memset(ifr, 0, sizeof(*ifr));
+    snprintf(ifr->ifr_name, IFNAMSIZ, "%s", ifname);
+}
+
+#if defined(__linux__)
 static bool has_vnet_hdr(int fd)
 {
     unsigned int features = 0;
@@ -158,11 +191,48 @@ static bool has_vnet_hdr(int fd)
     return true;
 }
 
-static void prep_ifreq(struct ifreq *ifr, const char *ifname)
+static int add_iface_to_bridge(const char *iface, const char *bridge, int ctlfd)
 {
-    memset(ifr, 0, sizeof(*ifr));
-    snprintf(ifr->ifr_name, IFNAMSIZ, "%s", ifname);
+    int ifindex;
+    int ret;
+    struct ifreq ifr;
+    prep_ifreq(&ifr, bridge);
+    ifindex = if_nametoindex(iface);
+#ifndef SIOCBRADDIF
+    unsigned long ifargs[4];
+    ifargs[0] = BRCTL_ADD_IF;
+    ifargs[1] = ifindex;
+    ifargs[2] = 0;
+    ifargs[3] = 0;
+    ifr.ifr_data = (void *)ifargs;
+    ret = ioctl(ctlfd, SIOCDEVPRIVATE, &ifr);
+#else
+    ifr.ifr_ifindex = ifindex;
+    ret = ioctl(ctlfd, SIOCBRADDIF, &ifr);
+#endif
+    return ret;
 }
+#else
+static bool has_vnet_hdr(int fd)
+{
+    return false;
+}
+static int add_iface_to_bridge(const char *iface, const char *bridge, int ctlfd)
+{
+    struct ifbreq req;
+    memset(&req, 0, sizeof(req));
+    strlcpy(req.ifbr_ifsname, iface, sizeof(req.ifbr_ifsname));
+
+    struct ifdrv ifd;
+    memset(&ifd, 0, sizeof(ifd));
+
+    strlcpy(ifd.ifd_name, bridge, sizeof(ifd.ifd_name));
+    ifd.ifd_cmd = BRDGADD;
+    ifd.ifd_len = sizeof(req);
+    ifd.ifd_data = &req;
+    return ioctl(ctlfd, SIOCSDRVSPEC, &ifd);
+}
+#endif
 
 static int send_fd(int c, int fd)
 {
@@ -215,10 +285,6 @@ static int drop_privileges(void)
 int main(int argc, char **argv)
 {
     struct ifreq ifr;
-#ifndef SIOCBRADDIF
-    unsigned long ifargs[4];
-#endif
-    int ifindex;
     int fd = -1, ctlfd = -1, unixfd = -1;
     int use_vnet = 0;
     int mtu;
@@ -310,30 +376,19 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+
     /* open the tap device */
-    fd = open("/dev/net/tun", O_RDWR);
+    memset(&iface, '\0', sizeof(char) * IFNAMSIZ);
+    int vnet_supported = has_vnet_hdr(fd);
+    Error *err = NULL;
+    fd = tap_open(&iface[0], sizeof(iface), &vnet_supported, use_vnet, 0, &err);
     if (fd == -1) {
-        fprintf(stderr, "failed to open /dev/net/tun: %s\n", strerror(errno));
+        fprintf(stderr, "failed to open %s: %s\n",
+                PATH_NET_TAP, error_get_pretty(err));
         ret = EXIT_FAILURE;
         goto cleanup;
     }
-
-    /* request a tap device, disable PI, and add vnet header support if
-     * requested and it's available. */
-    prep_ifreq(&ifr, "tap%d");
-    ifr.ifr_flags = IFF_TAP|IFF_NO_PI;
-    if (use_vnet && has_vnet_hdr(fd)) {
-        ifr.ifr_flags |= IFF_VNET_HDR;
-    }
-
-    if (ioctl(fd, TUNSETIFF, &ifr) == -1) {
-        fprintf(stderr, "failed to create tun device: %s\n", strerror(errno));
-        ret = EXIT_FAILURE;
-        goto cleanup;
-    }
-
-    /* save tap device name */
-    snprintf(iface, sizeof(iface), "%s", ifr.ifr_name);
+    error_free(err);
 
     /* get the mtu of the bridge */
     prep_ifreq(&ifr, bridge);
@@ -357,6 +412,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+#if defined(__linux__)
     /* Linux uses the lowest enslaved MAC address as the MAC address of
      * the bridge.  Set MAC address to a high value so that it doesn't
      * affect the MAC address of the bridge.
@@ -374,22 +430,10 @@ int main(int argc, char **argv)
         ret = EXIT_FAILURE;
         goto cleanup;
     }
+#endif
 
     /* add the interface to the bridge */
-    prep_ifreq(&ifr, bridge);
-    ifindex = if_nametoindex(iface);
-#ifndef SIOCBRADDIF
-    ifargs[0] = BRCTL_ADD_IF;
-    ifargs[1] = ifindex;
-    ifargs[2] = 0;
-    ifargs[3] = 0;
-    ifr.ifr_data = (void *)ifargs;
-    ret = ioctl(ctlfd, SIOCDEVPRIVATE, &ifr);
-#else
-    ifr.ifr_ifindex = ifindex;
-    ret = ioctl(ctlfd, SIOCBRADDIF, &ifr);
-#endif
-    if (ret == -1) {
+    if (add_iface_to_bridge(iface, bridge, ctlfd) == -1) {
         fprintf(stderr, "failed to add interface `%s' to bridge `%s': %s\n",
                 iface, bridge, strerror(errno));
         ret = EXIT_FAILURE;

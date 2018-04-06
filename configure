@@ -761,6 +761,7 @@ GNU/kFreeBSD)
 ;;
 FreeBSD)
   bsd="yes"
+  freebsd="yes"
   make="${MAKE-gmake}"
   audio_drv_list="oss"
   audio_possible_drivers="oss sdl pa"
@@ -6091,6 +6092,10 @@ fi
 
 if test "$linux" = "yes" ; then
   echo "CONFIG_LINUX=y" >> $config_host_mak
+fi
+
+if test "$freebsd" = "yes" ; then
+  echo "CONFIG_FREEBSD=y" >> $config_host_mak
 fi
 
 if test "$darwin" = "yes" ; then
